@@ -1,0 +1,154 @@
+---
+- hosts: localhost
+  connection: local
+  become: yes
+  gather_facts: no
+  tasks:
+  - name: check for id_rsa
+    stat:
+      path: /home/cloud-user/.ssh/id_rsa.pub
+    register: ssh_pubkey_here
+    changed_when: False
+    ignore_errors: yes
+  - debug:
+      var: ssh_pubkey_here
+    verbosity: 2
+  - name: Generate SSH keys
+    shell: ssh-keygen -b 2048 -t rsa -f /home/cloud-user/.ssh/id_rsa -q -N ""
+    args:
+      creates: /home/cloud-user/.ssh/id_rsa
+    when: not ssh_pubkey_here.stat.exists
+
+- hosts: machines
+  become: true
+  vars:
+    disk: "/dev/vdb"
+  tasks:
+  - name: install authorized_keys files
+    authorized_key:
+      key: "{{lookup('file', '/home/cloud-user/.ssh/id_rsa.pub')}}"
+      user: "{{item}}"
+    with_items:
+      - root
+      - cloud-user
+  - name: force dns error
+    lineinfile:
+      name: /etc/resolv.conf
+      regexp: '^nameserver 172.2.252.2$'
+      state: absent
+  - name: force dns
+    lineinfile:
+      name: /etc/resolv.conf
+      regexp: '^nameserver 172.25.252.2$'
+      state: present
+      line: 'nameserver 172.25.252.2'
+  - name: install Networkmanager-glib
+    package:
+      name: NetworkManager-glib
+      state: present
+
+  - name: network
+    nmcli:
+      state: present
+      dns4: "172.25.252.2"
+      gw4: "172.25.252.2"
+      conn_name: my_eth0
+      ifname: eth0
+      type: ethernet
+      ip4: "{{ lookup('dig',ansible_host) }}/24"
+  - name: force dns
+    lineinfile:
+      dest: /etc/resolv.conf
+      regexp: '^nameserver 172.2.252.2$'
+      state: present
+      line: 'nameserver 172.2.252.2'
+  - name: hostname
+    copy:
+      dest: /etc/hostname
+      content: "{{ansible_hostname}}"
+       
+  - name: remove other nameserver lines
+    lineinfile:
+      name: /etc/resolv.conf
+      line: 'nameserver 192.168.122.1'
+      state: absent
+  - name: change sudoers
+    lineinfile:
+      name: /etc/sudoers
+      regexp: '^%wheel\s'
+      line: '%wheel ALL=(ALL) NOPASSWD: ALL'
+      state: present
+  - name: we need the libselinux-python package
+    package:
+      name: libselinux-python
+      state: present
+  - name: ensure selinux is enforcing and installed
+    selinux:
+      policy: targeted
+      state: enforcing
+  - name: install packages
+    package:
+      name: "{{item}}"
+      state: present
+    with_items:
+      - docker
+      - parted
+      - centos-release-scl
+      - epel-release
+      - python-click
+      - bash-completion
+      - kexec-tools
+      - sos
+      - psacct
+      - wget
+      - git
+      - net-tools
+      - bind-utils
+      - iptables-services
+      - bridge-utils
+      - bash
+  - name: disable epel repo
+    lineinfile:
+      path: /etc/yum.repos.d/epel.repo
+      regexp: '^enabled='
+      line: 'enabled=0'
+      state: present
+  - name: more packages
+    package:
+      state: present
+      name: "{{item}}"
+    with_items:
+      - centos-release-openshift-origin15
+      - origin-excluder
+      - origin-docker-excluder
+  - name: ensure all packages are up-to-date
+    yum:
+      name: '*'
+      state: latest
+#  - name: ensure presence of second disk
+#    parted:
+#      device: "{{disk}}"
+#      label: msdos
+#      state: present
+  - name: create volume-group
+    lvg:
+      pvs: "{{disk}}"
+      vg: docker-vg
+  - name: setup extra storage
+    copy:
+      dest: /etc/sysconfig/docker-storage-setup
+      content: |
+        VG=docker-vg
+      owner: root
+      group: root
+      mode: 0644
+  - name: run docker-storage-setup
+    command: /bin/docker-storage-setup
+  - name: enable docker
+    service:
+      name: docker
+      enabled: yes
+  - name: start docker
+    service:
+      name: docker
+      state: started
